@@ -33,7 +33,7 @@ if sys.platform != "darwin":
 BASE_URL = os.environ.get(
     "JARVIS_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
 )
-MODEL = os.environ.get("JARVIS_MODEL", "gemini-2.5-flash")
+MODEL = os.environ.get("JARVIS_MODEL", "gemini-flash-latest")
 VOICE_NAME = "Daniel"  # British male voice, very JARVIS. Try "Samantha" etc.
 
 SYSTEM_PROMPT = (
@@ -313,20 +313,12 @@ def ask_jarvis(client: OpenAI, history: list) -> str:
         msg = resp.choices[0].message
         calls = msg.tool_calls or []
 
-        entry = {"role": "assistant", "content": msg.content or ""}
-        if calls:
-            entry["tool_calls"] = [
-                {
-                    "id": tc.id or f"call_{i}",
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments or "{}",
-                    },
-                }
-                for i, tc in enumerate(calls)
-            ]
-        history.append(entry)
+        for i, tc in enumerate(calls):
+            if not tc.id:
+                tc.id = f"call_{i}"
+        # Keep the model's message exactly as returned (Gemini 3 needs its hidden
+        # "thought signature" echoed back when it calls tools).
+        history.append(msg.model_dump(exclude_none=True))
 
         if not calls:
             return (msg.content or "").strip() or "Done, sir."
@@ -340,7 +332,7 @@ def ask_jarvis(client: OpenAI, history: list) -> str:
             print(f"  [action] {tc.function.name}({args}) -> {out}")
             history.append({
                 "role": "tool",
-                "tool_call_id": tc.id or f"call_{i}",
+                "tool_call_id": tc.id,
                 "content": out,
             })
     return "I seem to be going in circles, sir. Please try again."
@@ -393,6 +385,10 @@ def main():
             history.pop()
             answer = "My API key was rejected, sir. Please check it."
             print("  [error]", e)
+        except openai.NotFoundError as e:
+            history.pop()
+            answer = "My AI model seems to have been retired, sir. I need an update."
+            print(f"  [error] model={MODEL} {e}")
         except openai.OpenAIError as e:
             history.pop()
             answer = "I'm having trouble reaching my servers, sir."
