@@ -17,14 +17,14 @@ echo "==> Creating build environment..."
 python3 -m venv build_env
 source build_env/bin/activate
 pip install --upgrade pip
-pip install anthropic SpeechRecognition pyinstaller
+pip install openai SpeechRecognition pyinstaller
 CFLAGS="-I$(brew --prefix)/include" LDFLAGS="-L$(brew --prefix)/lib" pip install pyaudio
 
 echo "==> Building $APP_NAME.app..."
 rm -rf build dist
 pyinstaller --noconfirm --windowed --name "$APP_NAME" \
   --osx-bundle-identifier com.jarvis.assistant \
-  --collect-all anthropic --collect-all speech_recognition --collect-all certifi \
+  --collect-all openai --collect-all speech_recognition --collect-all certifi \
   --hidden-import jarvis_mac \
   jarvis_app.py
 

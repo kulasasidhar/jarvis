@@ -1,6 +1,9 @@
 """
 JARVIS for macOS - control your MacBook by voice or text, like Siri.
 
+Uses a FREE Google Gemini API key by default (get one at https://aistudio.google.com/apikey).
+Works with any OpenAI-compatible provider by setting JARVIS_BASE_URL and JARVIS_MODEL.
+
 Run:
   python3 jarvis_mac.py           -> text mode
   python3 jarvis_mac.py --voice   -> say "Jarvis, <command>" (wake word)
@@ -13,18 +16,24 @@ What it can do:
 
 import argparse
 import datetime
+import inspect
+import json
 import os
 import subprocess
 import sys
 import threading
 from urllib.parse import quote_plus
 
-import anthropic
+import openai
+from openai import OpenAI
 
 if sys.platform != "darwin":
-    sys.exit("This version is for macOS only. Use jarvis.py on other systems.")
+    sys.exit("This version is for macOS only.")
 
-MODEL = "claude-sonnet-5-5"
+BASE_URL = os.environ.get(
+    "JARVIS_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
+)
+MODEL = os.environ.get("JARVIS_MODEL", "gemini-2.5-flash")
 VOICE_NAME = "Daniel"  # British male voice, very JARVIS. Try "Samantha" etc.
 
 SYSTEM_PROMPT = (
@@ -220,19 +229,31 @@ TOOL_TABLE = {
     "get_time": (get_time, "Get the current date and time.", {}, []),
 }
 
-TOOLS = [
-    {"name": n, "description": d,
-     "input_schema": {"type": "object", "properties": p, "required": r}}
-    for n, (_, d, p, r) in TOOL_TABLE.items()
-]
+
+def _make_tool(name, description, props, required):
+    # Some providers reject tools with empty parameter lists, so give those a
+    # harmless optional placeholder (it is ignored when the tool runs).
+    if not props:
+        props = {"note": {"type": "string", "description": "Unused. Leave empty."}}
+    params = {"type": "object", "properties": props}
+    if required:
+        params["required"] = required
+    return {"type": "function",
+            "function": {"name": name, "description": description, "parameters": params}}
+
+
+TOOLS = [_make_tool(n, d, p, r) for n, (_, d, p, r) in TOOL_TABLE.items()]
 
 
 def run_tool(name: str, args: dict) -> str:
     entry = TOOL_TABLE.get(name)
     if not entry:
         return f"Unknown tool: {name}"
+    fn = entry[0]
+    allowed = inspect.signature(fn).parameters
+    clean = {k: v for k, v in (args or {}).items() if k in allowed}
     try:
-        return entry[0](**args)
+        return fn(**clean)
     except Exception as e:
         return f"Failed: {e}"
 
@@ -280,22 +301,49 @@ def next_voice_command(ears: Ears):
 
 # ---------- brain ----------
 
-def ask_jarvis(client, history):
-    while True:
-        resp = client.messages.create(
-            model=MODEL, max_tokens=400, system=SYSTEM_PROMPT,
-            tools=TOOLS, messages=history,
+def ask_jarvis(client: OpenAI, history: list) -> str:
+    """Send the conversation to the model, run any tools it requests, return final text."""
+    for _ in range(6):
+        resp = client.chat.completions.create(
+            model=MODEL,
+            max_tokens=2000,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
+            tools=TOOLS,
         )
-        history.append({"role": "assistant", "content": resp.content})
-        if resp.stop_reason != "tool_use":
-            return "".join(b.text for b in resp.content if b.type == "text").strip()
-        results = []
-        for b in resp.content:
-            if b.type == "tool_use":
-                out = run_tool(b.name, b.input)
-                print(f"  [action] {b.name}({b.input}) -> {out}")
-                results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
-        history.append({"role": "user", "content": results})
+        msg = resp.choices[0].message
+        calls = msg.tool_calls or []
+
+        entry = {"role": "assistant", "content": msg.content or ""}
+        if calls:
+            entry["tool_calls"] = [
+                {
+                    "id": tc.id or f"call_{i}",
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments or "{}",
+                    },
+                }
+                for i, tc in enumerate(calls)
+            ]
+        history.append(entry)
+
+        if not calls:
+            return (msg.content or "").strip() or "Done, sir."
+
+        for i, tc in enumerate(calls):
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            out = run_tool(tc.function.name, args)
+            print(f"  [action] {tc.function.name}({args}) -> {out}")
+            history.append({
+                "role": "tool",
+                "tool_call_id": tc.id or f"call_{i}",
+                "content": out,
+            })
+    return "I seem to be going in circles, sir. Please try again."
 
 
 def main():
@@ -303,11 +351,11 @@ def main():
     ap.add_argument("--voice", action="store_true")
     args = ap.parse_args()
 
-    key = os.environ.get("ANTHROPIC_API_KEY")
+    key = os.environ.get("JARVIS_API_KEY")
     if not key:
-        sys.exit("Set your key first:  export ANTHROPIC_API_KEY='your-key'")
+        sys.exit("Set your free Gemini key first:  export JARVIS_API_KEY='your-key'")
 
-    client = anthropic.Anthropic(api_key=key)
+    client = OpenAI(api_key=key, base_url=BASE_URL)
     ears = Ears() if args.voice else None
     history = []
 
@@ -337,11 +385,20 @@ def main():
         history.append({"role": "user", "content": text})
         try:
             answer = ask_jarvis(client, history)
-        except anthropic.APIError as e:
+        except openai.RateLimitError as e:
+            history.pop()
+            answer = "I've reached my free usage limit for now, sir. Please try again later."
+            print("  [error]", e)
+        except openai.AuthenticationError as e:
+            history.pop()
+            answer = "My API key was rejected, sir. Please check it."
+            print("  [error]", e)
+        except openai.OpenAIError as e:
             history.pop()
             answer = "I'm having trouble reaching my servers, sir."
             print("  [error]", e)
-        # keep memory short so it stays fast and cheap
+
+        # keep memory short so it stays fast
         if len(history) > 24:
             history = history[-24:]
             while history and not (history[0]["role"] == "user" and isinstance(history[0]["content"], str)):
